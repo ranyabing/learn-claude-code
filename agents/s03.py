@@ -1,48 +1,19 @@
-#!/usr/bin/env python3
-# Harness: on-demand knowledge -- domain expertise, loaded when the model asks.
-"""
-s05_skill_loading.py - Skills
-
-Two-layer skill injection that avoids bloating the system prompt:
-
-    Layer 1 (cheap): skill names in system prompt (~100 tokens/skill)
-    Layer 2 (on demand): full skill body in tool_result
-
-    skills/
-      pdf/
-        SKILL.md          <-- frontmatter (name, description) + body
-      code-review/
-        SKILL.md
-
-    System prompt:
-    +--------------------------------------+
-    | You are a coding agent.              |
-    | Skills available:                    |
-    |   - pdf: Process PDF files...        |  <-- Layer 1: metadata only
-    |   - code-review: Review code...      |
-    +--------------------------------------+
-
-    When model calls load_skill("pdf"):
-    +--------------------------------------+
-    | tool_result:                         |
-    | <skill>                              |
-    |   Full PDF processing instructions   |  <-- Layer 2: full body
-    |   Step 1: ...                        |
-    |   Step 2: ...                        |
-    | </skill>                             |
-    +--------------------------------------+
-
-Key insight: "Don't put everything in the system prompt. Load on demand."
-"""
-
 import os
-import re
 import subprocess
-import yaml
 from pathlib import Path
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    import readline
+    readline.parse_and_bind('set bind-tty-special-chars off')
+    readline.parse_and_bind('set input-meta on')
+    readline.parse_and_bind('set output-meta on')
+    readline.parse_and_bind('set convert-meta off')
+    readline.parse_and_bind('set enable-meta-keybindings on')
+except ImportError:
+    pass
 
 load_dotenv(override=True)
 
@@ -52,66 +23,49 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-SKILLS_DIR = WORKDIR / "skills"
 
-# -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
-class SkillLoader:
-    def __init__(self, skills_dir: Path):
-        self.skills_dir = skills_dir
-        self.skills = {}
-        self._load_all()
-
-    def _load_all(self):
-        if not self.skills_dir.exists():
-            return
-        for f in sorted(self.skills_dir.rglob("SKILL.md")):
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            name = meta.get("name", f.parent.name)
-            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
-
-    def _parse_frontmatter(self, text: str) -> tuple:
-        """Parse YAML frontmatter between --- delimiters."""
-        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-        if not match:
-            return {}, text
-        try:
-            meta = yaml.safe_load(match.group(1)) or {}
-        except yaml.YAMLError:
-            meta = {}
-        return meta, match.group(2).strip()
-
-    def get_descriptions(self) -> str:
-        """Layer 1: short descriptions for the system prompt."""
-        if not self.skills:
-            return "(no skills available)"
-        lines = []
-        for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "No description")
-            tags = skill["meta"].get("tags", "")
-            line = f"  - {name}: {desc}"
-            if tags:
-                line += f" [{tags}]"
-            lines.append(line)
-        return "\n".join(lines)
-
-    def get_content(self, name: str) -> str:
-        """Layer 2: full skill body returned in tool_result."""
-        skill = self.skills.get(name)
-        if not skill:
-            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
-
-
-SKILL_LOADER = SkillLoader(SKILLS_DIR)
-
-# Layer 1: skill metadata injected into system prompt
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Prefer tools over prose."""
 
-Skills available:
-{SKILL_LOADER.get_descriptions()}"""
+# -- TodoManager: structured state the LLM writes to --
+class TodoManager:
+    def __init__(self):
+        self.items = [] 
 
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+        validated = []
+        in_progress_count = 0   
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i+1)))
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time.")
+        self.items = validated
+        return self.render()
+    
+    def render(self) -> str:
+        if not self.items:
+            return "No todos"
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+    
+TODO = TodoManager()
 
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
@@ -161,13 +115,12 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
 TOOLS = [
@@ -179,39 +132,48 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "load_skill", "description": "Load specialized knowledge by name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
+    {"name": "todo", "description": "Update task list. Track progress on multi-step tasks.",
+     "input_schema": {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ['id', 'text', 'status']}}}, "required": ["items"]}},
 ]
 
-
+# -- Agent loop with nag reminder injection --
 def agent_loop(messages: list):
+    rounds_since_todo = 0
     while True:
+        # Nag reminder is injected below, alongside tool results
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+
         if response.stop_reason != "tool_use":
             return
         results = []
+        used_todo = False
+
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                    output = handler(**block.input) if handler else f"Unknown Tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
                 print(f"> {block.name}:")
                 print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                if block.name == "todo":
+                    used_todo = True
+        rounds_since_todo = 0 if used_todo else rounds_since_todo+1
+        if rounds_since_todo >= 3:
+            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})
-
-
+    
 if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms05 >> \033[0m")
+            query = input("\033[36ms03 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

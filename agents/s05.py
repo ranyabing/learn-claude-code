@@ -1,48 +1,21 @@
-#!/usr/bin/env python3
-# Harness: on-demand knowledge -- domain expertise, loaded when the model asks.
-"""
-s05_skill_loading.py - Skills
-
-Two-layer skill injection that avoids bloating the system prompt:
-
-    Layer 1 (cheap): skill names in system prompt (~100 tokens/skill)
-    Layer 2 (on demand): full skill body in tool_result
-
-    skills/
-      pdf/
-        SKILL.md          <-- frontmatter (name, description) + body
-      code-review/
-        SKILL.md
-
-    System prompt:
-    +--------------------------------------+
-    | You are a coding agent.              |
-    | Skills available:                    |
-    |   - pdf: Process PDF files...        |  <-- Layer 1: metadata only
-    |   - code-review: Review code...      |
-    +--------------------------------------+
-
-    When model calls load_skill("pdf"):
-    +--------------------------------------+
-    | tool_result:                         |
-    | <skill>                              |
-    |   Full PDF processing instructions   |  <-- Layer 2: full body
-    |   Step 1: ...                        |
-    |   Step 2: ...                        |
-    | </skill>                             |
-    +--------------------------------------+
-
-Key insight: "Don't put everything in the system prompt. Load on demand."
-"""
-
-import os
+import os 
 import re
-import subprocess
 import yaml
-from pathlib import Path
+import subprocess
 
+from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
+
+try:
+    import readline
+    readline.parse_and_bind('set bind-tty-special-chars off')
+    readline.parse_and_bind('set input-meta on')
+    readline.parse_and_bind('set output-meta on')
+    readline.parse_and_bind('set convert-meta off')
+    readline.parse_and_bind('set enable-meta-keybindings on')
+except ImportError:
+    pass
 
 load_dotenv(override=True)
 
@@ -54,13 +27,12 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 
-# -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
         self.skills = {}
         self._load_all()
-
+    
     def _load_all(self):
         if not self.skills_dir.exists():
             return
@@ -80,13 +52,13 @@ class SkillLoader:
         except yaml.YAMLError:
             meta = {}
         return meta, match.group(2).strip()
-
-    def get_descriptions(self) -> str:
-        """Layer 1: short descriptions for the system prompt."""
+    
+    def get_description(self) -> str:
+        """Layer 1: short description for the system prompt."""
         if not self.skills:
             return "(no skills available)"
         lines = []
-        for name, skill in self.skills.items():
+        for name,skill in self.skills.items():
             desc = skill["meta"].get("description", "No description")
             tags = skill["meta"].get("tags", "")
             line = f"  - {name}: {desc}"
@@ -94,15 +66,14 @@ class SkillLoader:
                 line += f" [{tags}]"
             lines.append(line)
         return "\n".join(lines)
-
+    
     def get_content(self, name: str) -> str:
-        """Layer 2: full skill body returned in tool_result."""
+        """Layer 2: full skill body returned in tool_result"""
         skill = self.skills.get(name)
         if not skill:
             return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
-        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
-
-
+        return f"<skill name= \"{name}\">\n{skill['body']}\n<skill>"
+    
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
 
 # Layer 1: skill metadata injected into system prompt
@@ -110,8 +81,8 @@ SYSTEM = f"""You are a coding agent at {WORKDIR}.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 
 Skills available:
-{SKILL_LOADER.get_descriptions()}"""
-
+{SKILL_LOADER.get_description()}
+"""
 
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
@@ -161,13 +132,12 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
 TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "bash":         lambda **kw: run_bash(kw["command"]),
+    "read_file":    lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file":   lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":    lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "load_skill":   lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
 TOOLS = [
@@ -179,10 +149,9 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "load_skill", "description": "Load specialized knowledge by name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
+     {"name": "load_skill", "description": "Load specialized knowledge by name.",
+      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
 ]
-
 
 def agent_loop(messages: list):
     while True:
@@ -201,12 +170,11 @@ def agent_loop(messages: list):
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}:")
+                print(f"> {block.name}")
                 print(str(output)[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})    
         messages.append({"role": "user", "content": results})
-
-
+    
 if __name__ == "__main__":
     history = []
     while True:
